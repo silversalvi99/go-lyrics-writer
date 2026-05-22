@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -16,60 +15,60 @@ import (
 	"github.com/bogem/id3v2/v2"
 	"github.com/dhowden/tag"
 	"github.com/fsnotify/fsnotify"
-	_ "github.com/mattn/go-sqlite3"
+	"go.etcd.io/bbolt"
 )
 
-const dbPath = "/root/data/lyrics.db"
-
-type Processor struct {
-	db *sql.DB
-}
+const (
+	dbPath     = "/root/data/lyrics.db"
+	bucketName = "processed_files"
+)
 
 func main() {
-	db, err := sql.Open("sqlite3", dbPath)
+	// 1. Initialize BoltDB (Pure Go, high performance, no CGO)
+	db, err := bbolt.Open(dbPath, 0600, nil)
 	if err != nil {
-		log.Fatal("Failed to connect to database:", err)
+		log.Fatal("Failed to open BoltDB:", err)
 	}
 	defer db.Close()
 
-	db.Exec("CREATE TABLE IF NOT EXISTS processed (path TEXT PRIMARY KEY, processed_at DATETIME)")
-	proc := &Processor{db: db}
+	db.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte(bucketName))
+		return err
+	})
 
+	// 2. Perform initial recursive scan of the music directory
 	log.Println("Starting initial recursive scan...")
 	filepath.Walk("/music", func(path string, info os.FileInfo, err error) error {
 		if !info.IsDir() && strings.HasSuffix(strings.ToLower(path), ".mp3") {
-			proc.processTrack(path)
+			processTrack(db, path)
 		}
 		return nil
 	})
 
+	// 3. Setup file system watcher for real-time updates
 	watcher, _ := fsnotify.NewWatcher()
 	defer watcher.Close()
 	watcher.Add("/music")
 
 	log.Println("Monitoring /music for changes...")
-	for {
-		select {
-		case event := <-watcher.Events:
-			if (event.Op&fsnotify.Create == fsnotify.Create) && strings.HasSuffix(strings.ToLower(event.Name), ".mp3") {
-				time.Sleep(2 * time.Second)
-				proc.processTrack(event.Name)
-			}
+
+	// Idiomatic range loop over the events channel
+	for event := range watcher.Events {
+		if (event.Op&fsnotify.Create == fsnotify.Create) && strings.HasSuffix(strings.ToLower(event.Name), ".mp3") {
+			// Small delay to ensure the file system has finished writing the file
+			time.Sleep(2 * time.Second)
+			processTrack(db, event.Name)
 		}
 	}
 }
 
-// getMetadataFromPath extracts artist/title from directory structure (Highest Reliability)
+// getMetadataFromPath extracts artist/title from directory structure
 func getMetadataFromPath(path string) (string, string) {
 	parts := strings.Split(path, string(os.PathSeparator))
-	// Expected: /music/Artist/Album/Song.mp3 or /music/Song.mp3
 	if len(parts) >= 4 {
 		return parts[len(parts)-3], strings.TrimSuffix(parts[len(parts)-1], ".mp3")
 	}
-	if len(parts) >= 2 {
-		return "", strings.TrimSuffix(parts[len(parts)-1], ".mp3")
-	}
-	return "", ""
+	return "", strings.TrimSuffix(parts[len(parts)-1], ".mp3")
 }
 
 // sanitizeMetadata cleans strings using regex
@@ -81,13 +80,22 @@ func sanitizeMetadata(artist, title string) (string, string) {
 	return strings.TrimSpace(artist), strings.TrimSpace(title)
 }
 
-func (p *Processor) processTrack(path string) {
-	var exists string
-	if err := p.db.QueryRow("SELECT path FROM processed WHERE path = ?", path).Scan(&exists); err == nil {
+// processTrack handles the workflow: Check DB -> Extract Metadata -> Fetch Lyrics -> Inject
+func processTrack(db *bbolt.DB, path string) {
+	// Check if already processed
+	exists := false
+	db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(bucketName))
+		if b.Get([]byte(path)) != nil {
+			exists = true
+		}
+		return nil
+	})
+	if exists {
 		return
 	}
 
-	// 1. Try Path-based extraction
+	// 1. Path-based extraction (Highest Reliability)
 	artist, title := getMetadataFromPath(path)
 
 	// 2. Fallback to ID3 tags if path is insufficient
@@ -96,8 +104,12 @@ func (p *Processor) processTrack(path string) {
 		if err == nil {
 			m, _ := tag.ReadFrom(f)
 			a, t := sanitizeMetadata(m.Artist(), m.Title())
-			if artist == "" { artist = a }
-			if title == "" { title = t }
+			if artist == "" {
+				artist = a
+			}
+			if title == "" {
+				title = t
+			}
 			f.Close()
 		}
 	}
@@ -113,28 +125,38 @@ func (p *Processor) processTrack(path string) {
 	if err == nil {
 		tagFile, err := id3v2.Open(path, id3v2.Options{Parse: true})
 		if err == nil {
+			defer tagFile.Close()
 			tagFile.AddUnsynchronisedLyricsFrame(id3v2.UnsynchronisedLyricsFrame{
-				Encoding: id3v2.EncodingUTF8, Language: "ita", ContentDescriptor: "Lyrics", Lyrics: lyrics,
+				Encoding:          id3v2.EncodingUTF8,
+				Language:          "ita",
+				ContentDescriptor: "Lyrics",
+				Lyrics:            lyrics,
 			})
 			tagFile.Save()
-			tagFile.Close()
-			p.db.Exec("INSERT INTO processed (path, processed_at) VALUES (?, ?)", path, time.Now())
+			db.Update(func(tx *bbolt.Tx) error {
+				return tx.Bucket([]byte(bucketName)).Put([]byte(path), []byte("1"))
+			})
 			log.Printf("Successfully injected: %s", title)
 		}
 	}
 }
 
+// fetchLyrics communicates with LRCLIB API to retrieve lyrics
 func fetchLyrics(artist, title string) (string, error) {
-	u := fmt.Sprintf("https://lrclib.net/api/get?artist_name=%s&track_name=%s", url.QueryEscape(artist), url.QueryEscape(title))
+	u := fmt.Sprintf("https://lrclib.net/api/get?artist_name=%s&track_name=%s",
+		url.QueryEscape(artist), url.QueryEscape(title))
+
 	resp, err := http.Get(u)
-	if err != nil || resp.StatusCode != http.StatusOK { return "", fmt.Errorf("API error") }
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API error")
+	}
 	defer resp.Body.Close()
 
-	var result struct {
+	var res struct {
 		PlainLyrics string `json:"plainLyrics"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || result.PlainLyrics == "" {
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil || res.PlainLyrics == "" {
 		return "", fmt.Errorf("not found")
 	}
-	return result.PlainLyrics, nil
+	return res.PlainLyrics, nil
 }
